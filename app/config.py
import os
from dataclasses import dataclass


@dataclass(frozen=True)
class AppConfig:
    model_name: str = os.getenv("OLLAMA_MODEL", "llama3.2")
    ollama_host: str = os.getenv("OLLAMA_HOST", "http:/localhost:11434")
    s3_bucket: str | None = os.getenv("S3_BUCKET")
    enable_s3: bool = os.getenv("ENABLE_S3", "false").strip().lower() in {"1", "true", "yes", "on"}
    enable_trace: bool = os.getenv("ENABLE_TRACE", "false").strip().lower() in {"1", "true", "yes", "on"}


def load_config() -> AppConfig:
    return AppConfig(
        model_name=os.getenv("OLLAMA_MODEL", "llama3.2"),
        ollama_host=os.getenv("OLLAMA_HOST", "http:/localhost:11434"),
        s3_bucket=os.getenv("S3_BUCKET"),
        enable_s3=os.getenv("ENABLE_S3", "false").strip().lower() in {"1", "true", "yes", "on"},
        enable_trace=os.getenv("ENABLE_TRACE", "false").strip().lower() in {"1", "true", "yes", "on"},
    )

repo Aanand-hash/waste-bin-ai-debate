@@ -1,0 +1,113 @@
+import argparse
+import os
+import time
+import uuid
+
+from app.config import load_config
+from app.debate import DebateEngine
+from app.storage import S3JSONStore, build_run_summary
+from app.tracing import log_trace
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Decide which waste bin an item should go in by having AI experts debate it first."
+    )
+    parser.add_argument("item", nargs="?", help="Item to sort (e.g. 'coffee cup', 'banana peel', 'used battery')")
+    parser.add_argument("--item", dest="item_flag", help="Item to sort via flag")
+    parser.add_argument("--model", default=None, help="Ollama model name to use")
+    parser.add_argument("--s3-bucket", default=None, help="S3 bucket for JSON exports")
+    parser.add_argument("--disable-s3", action="store_true", help="Disable S3 uploads even if configured")
+    parser.add_argument("--trace", action="store_true", help="Enable optional trace logging to stderr")
+    return parser.parse_args()
+
+
+def resolve_item(args: argparse.Namespace) -> str:
+    for value in (args.item, args.item_flag):
+        if value and value.strip():
+            return value.strip()
+    return input("Enter the item to sort: ").strip()
+
+
+def print_latency_summary(run, run_id: str, item: str) -> None:
+    print("\n=== Latency Summary ===")
+    print(f"Run ID: {run_id}")
+    print(f"Item: {item}")
+
+    for turn in run.experts:
+        print(f"- {turn.expert} ({turn.bin}): {turn.duration_seconds:.3f}s")
+    if run.judge:
+        print(f"- Judge: {run.judge.duration_seconds:.3f}s")
+    print(f"- Total run: {run.run_duration_seconds:.3f}s")
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_config()
+
+    if args.model:
+        os.environ["OLLAMA_MODEL"] = args.model
+        config = load_config()
+    if args.s3_bucket:
+        os.environ["S3_BUCKET"] = args.s3_bucket
+        config = load_config()
+    if args.trace:
+        os.environ["ENABLE_TRACE"] = "true"
+        config = load_config()
+    if args.disable_s3:
+        os.environ["ENABLE_S3"] = "false"
+        config = load_config()
+
+    item = resolve_item(args)
+    run_id = str(uuid.uuid4())
+
+    print(f"\nSorting item: {item}")
+    print(f"Using Ollama model: {config.model_name}")
+
+    storage = S3JSONStore(config)
+    engine = DebateEngine(config)
+
+    start = time.perf_counter()
+    try:
+        debate_run = engine.run(item)
+    except Exception as exc:  # pragma: no cover - runtime issue when Ollama isn't available
+        print(f"\n[ERROR] Failed to complete debate: {exc}")
+        raise SystemExit(1) from exc
+    finally:
+        elapsed = time.perf_counter() - start
+        if "debate_run" not in locals():
+            debate_run = None
+
+    if debate_run is not None:
+        debate_run.run_duration_seconds = round(elapsed, 3)
+
+    summary = build_run_summary(run_id, item, {
+        "item": item,
+        "experts": [
+            {
+                "expert": turn.expert,
+                "bin": turn.bin,
+                "response": turn.response.strip(),
+                "duration_seconds": turn.duration_seconds,
+            }
+            for turn in debate_run.experts
+        ] if debate_run else [],
+        "judge": {
+            "final_bin": debate_run.judge.final_bin if debate_run and debate_run.judge else None,
+            "reasoning": debate_run.judge.reasoning if debate_run and debate_run.judge else None,
+            "duration_seconds": debate_run.judge.duration_seconds if debate_run and debate_run.judge else None,
+        },
+        "run_duration_seconds": debate_run.run_duration_seconds if debate_run else round(elapsed, 3),
+    })
+
+    storage.save_debate(run_id, item, summary)
+    storage.save_run_summary(run_id, summary)
+
+    if debate_run is not None:
+        print_latency_summary(debate_run, run_id, item)
+
+    log_trace("Run complete", run_id=run_id, item=item, elapsed_seconds=round(elapsed, 3))
+
+
+if __name__ == "__main__":
+    main()

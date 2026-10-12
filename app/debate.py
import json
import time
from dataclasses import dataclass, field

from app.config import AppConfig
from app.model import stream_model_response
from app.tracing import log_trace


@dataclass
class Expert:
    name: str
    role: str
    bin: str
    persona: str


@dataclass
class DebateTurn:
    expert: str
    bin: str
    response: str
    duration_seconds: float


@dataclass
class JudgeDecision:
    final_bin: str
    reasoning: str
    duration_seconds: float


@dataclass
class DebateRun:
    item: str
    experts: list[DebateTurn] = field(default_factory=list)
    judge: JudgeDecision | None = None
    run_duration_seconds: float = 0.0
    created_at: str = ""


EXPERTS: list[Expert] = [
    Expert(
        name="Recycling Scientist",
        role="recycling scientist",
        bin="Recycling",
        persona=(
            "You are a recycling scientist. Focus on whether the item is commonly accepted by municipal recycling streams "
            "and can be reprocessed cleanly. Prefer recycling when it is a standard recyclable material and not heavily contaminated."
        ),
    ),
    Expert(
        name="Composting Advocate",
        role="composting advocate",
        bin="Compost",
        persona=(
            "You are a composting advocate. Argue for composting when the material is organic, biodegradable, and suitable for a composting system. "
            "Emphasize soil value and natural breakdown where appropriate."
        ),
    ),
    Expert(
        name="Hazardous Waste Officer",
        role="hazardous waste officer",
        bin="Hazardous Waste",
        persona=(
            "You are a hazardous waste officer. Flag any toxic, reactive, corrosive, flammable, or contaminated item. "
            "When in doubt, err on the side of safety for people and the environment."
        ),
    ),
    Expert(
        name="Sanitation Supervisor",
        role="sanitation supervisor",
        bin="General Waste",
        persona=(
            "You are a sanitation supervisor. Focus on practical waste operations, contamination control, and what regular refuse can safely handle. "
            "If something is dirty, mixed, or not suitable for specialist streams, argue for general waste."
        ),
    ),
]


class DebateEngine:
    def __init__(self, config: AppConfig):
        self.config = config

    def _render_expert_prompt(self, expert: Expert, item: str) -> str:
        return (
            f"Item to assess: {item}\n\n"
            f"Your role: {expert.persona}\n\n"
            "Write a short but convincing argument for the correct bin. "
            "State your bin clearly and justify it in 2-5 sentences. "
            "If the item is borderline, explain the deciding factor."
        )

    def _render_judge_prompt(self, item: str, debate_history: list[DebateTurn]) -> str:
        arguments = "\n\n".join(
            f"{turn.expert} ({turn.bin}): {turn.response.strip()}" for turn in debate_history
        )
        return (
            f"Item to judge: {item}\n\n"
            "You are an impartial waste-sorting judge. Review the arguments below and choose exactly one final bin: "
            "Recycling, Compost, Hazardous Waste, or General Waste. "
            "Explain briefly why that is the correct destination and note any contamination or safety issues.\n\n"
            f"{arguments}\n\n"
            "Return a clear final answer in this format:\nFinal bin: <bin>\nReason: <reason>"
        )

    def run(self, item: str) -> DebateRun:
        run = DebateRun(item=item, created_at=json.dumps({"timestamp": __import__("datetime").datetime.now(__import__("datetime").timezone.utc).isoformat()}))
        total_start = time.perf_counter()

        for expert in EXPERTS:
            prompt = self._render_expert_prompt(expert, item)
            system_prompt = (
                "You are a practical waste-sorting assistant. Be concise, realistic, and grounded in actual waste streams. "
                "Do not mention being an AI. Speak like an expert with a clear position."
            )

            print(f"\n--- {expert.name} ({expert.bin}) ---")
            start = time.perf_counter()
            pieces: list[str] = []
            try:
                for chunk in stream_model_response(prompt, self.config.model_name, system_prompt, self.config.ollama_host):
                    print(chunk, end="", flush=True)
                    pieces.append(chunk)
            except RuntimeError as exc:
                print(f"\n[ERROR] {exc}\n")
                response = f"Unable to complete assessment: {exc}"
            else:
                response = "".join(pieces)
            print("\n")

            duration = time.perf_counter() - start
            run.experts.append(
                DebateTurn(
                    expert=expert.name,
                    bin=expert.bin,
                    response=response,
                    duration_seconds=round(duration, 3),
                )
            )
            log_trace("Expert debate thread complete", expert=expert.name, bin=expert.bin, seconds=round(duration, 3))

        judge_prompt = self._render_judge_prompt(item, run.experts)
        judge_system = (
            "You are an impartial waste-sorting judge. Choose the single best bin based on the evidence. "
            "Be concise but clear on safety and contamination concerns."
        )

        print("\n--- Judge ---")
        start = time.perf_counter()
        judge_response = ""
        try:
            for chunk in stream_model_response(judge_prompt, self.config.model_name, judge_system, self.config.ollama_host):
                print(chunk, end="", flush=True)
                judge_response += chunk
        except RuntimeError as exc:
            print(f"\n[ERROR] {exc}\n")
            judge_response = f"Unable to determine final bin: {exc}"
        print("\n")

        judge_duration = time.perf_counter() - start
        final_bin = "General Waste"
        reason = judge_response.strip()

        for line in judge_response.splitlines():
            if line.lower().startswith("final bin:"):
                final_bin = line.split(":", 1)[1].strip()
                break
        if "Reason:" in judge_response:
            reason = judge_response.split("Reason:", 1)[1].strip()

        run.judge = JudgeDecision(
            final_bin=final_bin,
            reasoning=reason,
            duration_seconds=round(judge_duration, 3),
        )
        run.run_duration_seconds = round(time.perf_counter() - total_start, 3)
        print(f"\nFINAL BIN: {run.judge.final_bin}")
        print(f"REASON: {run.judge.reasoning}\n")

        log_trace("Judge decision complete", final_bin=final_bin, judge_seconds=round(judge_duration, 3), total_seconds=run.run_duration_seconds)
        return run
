@@ -1,0 +1,90 @@
+import json
+import os
+import re
+from datetime import datetime, timezone
+from typing import Any
+
+from app.config import AppConfig
+from app.tracing import log_trace
+
+
+def _safe_json_dump(value: Any) -> str:
+    return json.dumps(value, indent=2, default=str)
+
+
+class S3JSONStore:
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self._client = None
+        self._available = False
+        if not config.enable_s3:
+            return
+        try:
+            import boto3
+        except ImportError:
+            log_trace("boto3 not installed; continuing without S3 storage")
+            return
+
+        bucket = config.s3_bucket or os.getenv("S3_BUCKET")
+        if not bucket:
+            log_trace("S3_BUCKET not configured; skipping S3 upload")
+            return
+
+        try:
+            self._client = boto3.client("s3")
+            self._client.head_bucket(Bucket=bucket)
+            self._available = True
+            log_trace("S3 connection verified", bucket=bucket)
+        except Exception as exc:  # pragma: no cover - environment-dependent
+            log_trace("S3 unavailable; continuing without it", error=str(exc))
+            self._available = False
+
+    def save_run_summary(self, run_id: str, payload: dict[str, Any]) -> None:
+        if not self._available or self._client is None:
+            return
+        bucket = self.config.s3_bucket or os.getenv("S3_BUCKET")
+        if not bucket:
+            return
+        key = f"run-summaries/{run_id}.json"
+        try:
+            self._client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=_safe_json_dump(payload).encode("utf-8"),
+                ContentType="application/json",
+            )
+            log_trace("Saved run summary to S3", bucket=bucket, key=key)
+        except Exception as exc:  # pragma: no cover
+            log_trace("Failed to save run summary to S3", error=str(exc))
+
+    def save_debate(self, run_id: str, item: str, payload: dict[str, Any]) -> None:
+        if not self._available or self._client is None:
+            return
+        bucket = self.config.s3_bucket or os.getenv("S3_BUCKET")
+        if not bucket:
+            return
+        key = f"debates/{run_id}/{slugify(item)}.json"
+        try:
+            self._client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=_safe_json_dump(payload).encode("utf-8"),
+                ContentType="application/json",
+            )
+            log_trace("Saved debate JSON to S3", bucket=bucket, key=key)
+        except Exception as exc:  # pragma: no cover
+            log_trace("Failed to save debate JSON to S3", error=str(exc))
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "item"
+
+
+def build_run_summary(run_id: str, item: str, debate_run: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "run_id": run_id,
+        "item": item,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "debate": debate_run,
+    }
