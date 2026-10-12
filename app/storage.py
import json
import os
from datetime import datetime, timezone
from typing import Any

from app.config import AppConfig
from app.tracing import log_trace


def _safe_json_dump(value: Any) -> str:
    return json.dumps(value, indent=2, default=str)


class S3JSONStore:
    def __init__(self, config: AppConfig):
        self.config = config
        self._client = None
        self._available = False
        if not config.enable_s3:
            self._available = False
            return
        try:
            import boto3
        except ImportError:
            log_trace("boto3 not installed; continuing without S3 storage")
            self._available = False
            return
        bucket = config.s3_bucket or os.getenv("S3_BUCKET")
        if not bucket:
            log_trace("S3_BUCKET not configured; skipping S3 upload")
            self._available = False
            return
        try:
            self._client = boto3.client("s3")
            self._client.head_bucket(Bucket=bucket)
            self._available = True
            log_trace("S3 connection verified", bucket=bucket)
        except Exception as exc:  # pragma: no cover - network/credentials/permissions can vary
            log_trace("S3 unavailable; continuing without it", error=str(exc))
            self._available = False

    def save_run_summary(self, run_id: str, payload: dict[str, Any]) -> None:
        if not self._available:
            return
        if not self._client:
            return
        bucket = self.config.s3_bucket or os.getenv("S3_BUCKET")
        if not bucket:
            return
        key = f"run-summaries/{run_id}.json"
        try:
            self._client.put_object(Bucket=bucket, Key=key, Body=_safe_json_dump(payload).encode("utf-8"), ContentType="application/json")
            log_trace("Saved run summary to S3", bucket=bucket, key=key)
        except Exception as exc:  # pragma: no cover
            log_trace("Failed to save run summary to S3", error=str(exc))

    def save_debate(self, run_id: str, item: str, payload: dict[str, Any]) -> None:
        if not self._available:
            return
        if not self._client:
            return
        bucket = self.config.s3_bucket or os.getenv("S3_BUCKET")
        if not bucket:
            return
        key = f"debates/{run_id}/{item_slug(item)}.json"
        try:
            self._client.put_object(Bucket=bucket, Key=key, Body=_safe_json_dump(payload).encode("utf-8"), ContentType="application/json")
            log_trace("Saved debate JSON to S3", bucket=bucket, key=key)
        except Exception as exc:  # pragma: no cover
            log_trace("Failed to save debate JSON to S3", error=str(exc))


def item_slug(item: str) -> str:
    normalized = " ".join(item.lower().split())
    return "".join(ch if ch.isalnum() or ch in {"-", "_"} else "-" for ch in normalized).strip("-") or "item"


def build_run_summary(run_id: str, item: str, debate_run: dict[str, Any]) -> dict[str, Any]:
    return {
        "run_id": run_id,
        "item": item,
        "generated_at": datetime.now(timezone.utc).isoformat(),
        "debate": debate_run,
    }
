@@ -1,0 +1,182 @@
+import json
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from app.config import AppConfig
+from app.model import generate_completion, stream_model_response
+from app.tracing import log_trace
+
+
+@dataclass
+class Expert:
+    name: str
+    role: str
+    bin: str
+    persona: str
+
+
+@dataclass
+class DebateTurn:
+    expert: str
+    bin: str
+    response: str
+    duration_seconds: float
+
+
+@dataclass
+class JudgeDecision:
+    final_bin: str
+    reasoning: str
+    duration_seconds: float
+
+
+@dataclass
+class DebateRun:
+    item: str
+    experts: list[DebateTurn] = field(default_factory=list)
+    judge: JudgeDecision | None = None
+    run_duration_seconds: float = 0.0
+    created_at: str = ""
+
+
+EXPERTS: list[Expert] = [
+    Expert(
+        name="Recycling Scientist",
+        role="recycling scientist",
+        bin="Recycling",
+        persona=(
+            "You are a recycling scientist. Look for materials that can be reprocessed in municipal recycling streams. "
+            "Prefer recycling when the item is clean, commonly accepted, and can be turned into feedstock. "
+            "Do not exaggerate contamination or safety risks unless they are real. Keep the argument practical and evidence-based."
+        ),
+    ),
+    Expert(
+        name="Composting Advocate",
+        role="composting advocate",
+        bin="Compost",
+        persona=(
+            "You are a composting advocate. Argue for composting when the material is organic, biodegradable, and suitable for a compost system. "
+            "Emphasize natural decomposition and the value of turning food or plant matter into soil amendment."
+        ),
+    ),
+    Expert(
+        name="Hazardous Waste Officer",
+        role="hazardous waste officer",
+        bin="Hazardous Waste",
+        persona=(
+            "You are a hazardous waste officer. Flag anything that is toxic, reactive, flammable, corrosive, contaminated, or likely to harm people or the environment. "
+            "When in doubt, choose a safer hazardous waste classification when the material is dangerous or mixed with dangerous substances."
+        ),
+    ),
+    Expert(
+        name="Sanitation Supervisor",
+        role="sanitation supervisor",
+        bin="General Waste",
+        persona=(
+            "You are a sanitation supervisor. Focus on operational practicality, contamination control, and what the regular waste stream can safely handle. "
+            "If the item is dirty, mixed, or not suitable for specialist streams, argue for general waste rather than a more complex route."
+        ),
+    ),
+]
+
+
+class DebateEngine:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    def _render_expert_prompt(self, expert: Expert, item: str) -> str:
+        return (
+            f"Item to assess: {item}\n\n"
+            f"Your role: {expert.persona}\n\n"
+            "Write a short but convincing argument for which bin this item belongs in. "
+            "State your bin clearly and justify it in 2-5 sentences. "
+            "If the item is borderline, explain the deciding factor."
+        )
+
+    def _render_judge_prompt(self, item: str, debate_history: list[DebateTurn]) -> str:
+        arguments = "\n\n".join(
+            f"{turn.expert} ({turn.bin}): {turn.response.strip()}" for turn in debate_history
+        )
+        return (
+            f"Item to judge: {item}\n\n"
+            "You are an impartial waste sorting judge. Review the arguments from the four experts below. "
+            "Choose exactly one final bin: Recycling, Compost, Hazardous Waste, or General Waste. "
+            "Explain briefly why that is the correct destination and note any important contamination or safety concerns.\n\n"
+            f"{arguments}\n\n"
+            "Return a clear final answer in this format: '\nFinal bin: <bin>\nReason: <reason>'"
+        )
+
+    def run(self, item: str) -> DebateRun:
+        run = DebateRun(item=item, created_at=json.dumps({"timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()}))
+        start_total = time.perf_counter()
+
+        for expert in EXPERTS:
+            prompt = self._render_expert_prompt(expert, item)
+            system_prompt = (
+                "You are a practical waste-sorting assistant. Provide a clear, concise opinion only. "
+                "Do not mention that you are an AI. Be specific and grounded in real-world waste streams."
+            )
+            print(f"\n--- {expert.name} ({expert.bin}) ---")
+            start = time.perf_counter()
+            collected: list[str] = []
+            try:
+                for chunk in stream_model_response(prompt, self.config.model_name, system_prompt, self.config.ollama_host):
+                    print(chunk, end="", flush=True)
+                    collected.append(chunk)
+                print("\n")
+            except RuntimeError as exc:
+                print(f"\n[ERROR] {exc}\n")
+                response = f"Unable to complete expert analysis: {exc}"
+            else:
+                response = "".join(collected)
+            duration = time.perf_counter() - start
+            run.experts.append(
+                DebateTurn(
+                    expert=expert.name,
+                    bin=expert.bin,
+                    response=response,
+                    duration_seconds=round(duration, 3),
+                )
+            )
+            log_trace("Expert debate turn complete", expert=expert.name, bin=expert.bin, seconds=round(duration, 3))
+
+        judge_prompt = self._render_judge_prompt(item, run.experts)
+        judge_system = (
+            "You are an impartial waste sorting judge. Choose the most appropriate final bin. "
+            "Be concise but clear. Provide a final bin and a brief explanation."
+        )
+        print("\n--- Judge ---")
+        start = time.perf_counter()
+        judge_response = ""
+        try:
+            for chunk in stream_model_response(judge_prompt, self.config.model_name, judge_system, self.config.ollama_host):
+                print(chunk, end="", flush=True)
+                judge_response += chunk
+            print("\n")
+        except RuntimeError as exc:
+            print(f"\n[ERROR] {exc}\n")
+            judge_response = f"Unable to determine final bin: {exc}"
+        judge_duration = time.perf_counter() - start
+
+        final_bin = "General Waste"
+        reason = judge_response.strip()
+        if "Final bin:" in judge_response:
+            for line in judge_response.splitlines():
+                if line.lower().startswith("final bin:"):
+                    final_bin = line.split(":", 1)[1].strip()
+                    break
+        if "Reason:" in judge_response:
+            reason = judge_response.split("Reason:", 1)[1].strip()
+
+        run.judge = JudgeDecision(
+            final_bin=final_bin,
+            reasoning=reason,
+            duration_seconds=round(judge_duration, 3),
+        )
+        run.run_duration_seconds = round(time.perf_counter() - start_total, 3)
+        log_trace("Judge decision complete", final_bin=final_bin, seconds=round(judge_duration, 3), total_seconds=run.run_duration_seconds)
+
+        print(f"\nFINAL BIN: {run.judge.final_bin}")
+        print(f"REASON: {run.judge.reasoning}\n")
+        return run
